@@ -446,6 +446,24 @@ class TestMCPServerTask:
             mock_read, mock_write,
         )
 
+    def _mock_sse_and_session(self, session):
+        """Return patches for sse_client and ClientSession as async CMs."""
+        mock_read, mock_write = MagicMock(), MagicMock()
+
+        mock_sse_cm = MagicMock()
+        mock_sse_cm.__aenter__ = AsyncMock(return_value=(mock_read, mock_write))
+        mock_sse_cm.__aexit__ = AsyncMock(return_value=False)
+
+        mock_cs_cm = MagicMock()
+        mock_cs_cm.__aenter__ = AsyncMock(return_value=session)
+        mock_cs_cm.__aexit__ = AsyncMock(return_value=False)
+
+        return (
+            patch("tools.mcp_tool.sse_client", return_value=mock_sse_cm, create=True),
+            patch("tools.mcp_tool.ClientSession", return_value=mock_cs_cm),
+            mock_read, mock_write,
+        )
+
     def test_start_connects_and_discovers_tools(self):
         """start() creates a Task that connects, discovers tools, and waits."""
         from tools.mcp_tool import MCPServerTask
@@ -540,6 +558,44 @@ class TestMCPServerTask:
 
                 assert server.session is None
                 assert server._task.done()
+
+        asyncio.run(_test())
+
+    def test_start_detects_sse_transport_from_url(self):
+        """Remote URLs ending in /sse use the legacy SSE transport."""
+        from tools.mcp_tool import MCPServerTask
+
+        mock_tools = [_make_mcp_tool("echo")]
+        mock_session = MagicMock()
+        mock_session.initialize = AsyncMock()
+        mock_session.list_tools = AsyncMock(
+            return_value=SimpleNamespace(tools=mock_tools)
+        )
+
+        p_sse, p_cs, _, _ = self._mock_sse_and_session(mock_session)
+
+        async def _test():
+            with patch("tools.mcp_tool._MCP_SSE_AVAILABLE", True), p_sse as mock_sse, p_cs:
+                server = MCPServerTask("sse_srv")
+                await server.start(
+                    {
+                        "url": "https://example.com/sse",
+                        "headers": {"Authorization": "Bearer tok"},
+                    }
+                )
+
+                assert server.session is mock_session
+                assert server._transport() == "sse"
+                mock_sse.assert_called_once_with(
+                    "https://example.com/sse",
+                    headers={"Authorization": "Bearer tok"},
+                    timeout=60.0,
+                    sse_read_timeout=300.0,
+                    auth=None,
+                )
+
+                await server.shutdown()
+                assert server.session is None
 
         asyncio.run(_test())
 
@@ -1016,6 +1072,23 @@ class TestHTTPConfig:
         server._config = config
         assert server._is_http() is True
 
+    def test_detects_sse_transport_from_url_suffix(self):
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("legacy")
+        server._config = {"url": "https://example.com/sse"}
+
+        assert server._is_http() is True
+        assert server._transport() == "sse"
+
+    def test_explicit_sse_transport_overrides_non_sse_url(self):
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("explicit")
+        server._config = {"url": "https://example.com/mcp", "transport": "sse"}
+
+        assert server._transport() == "sse"
+
     def test_http_unavailable_raises(self):
         from tools.mcp_tool import MCPServerTask
 
@@ -1026,6 +1099,19 @@ class TestHTTPConfig:
             with patch("tools.mcp_tool._MCP_HTTP_AVAILABLE", False):
                 with pytest.raises(ImportError, match="HTTP transport"):
                     await server._run_http(config)
+
+        asyncio.run(_test())
+
+    def test_sse_unavailable_raises(self):
+        from tools.mcp_tool import MCPServerTask
+
+        server = MCPServerTask("legacy")
+        config = {"url": "https://example.com/sse"}
+
+        async def _test():
+            with patch("tools.mcp_tool._MCP_SSE_AVAILABLE", False):
+                with pytest.raises(ImportError, match="SSE transport"):
+                    await server._run_sse(config)
 
         asyncio.run(_test())
 

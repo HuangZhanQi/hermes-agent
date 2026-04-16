@@ -74,12 +74,18 @@ Use stdio servers when:
 
 ### HTTP servers
 
-HTTP MCP servers are remote endpoints Hermes connects to directly.
+HTTP MCP servers are remote endpoints Hermes connects to directly. Legacy SSE endpoints are also supported.
 
 ```yaml
 mcp_servers:
   remote_api:
     url: "https://mcp.example.com/mcp"
+    headers:
+      Authorization: "Bearer ***"
+
+  legacy_remote_api:
+    url: "https://mcp.example.com/sse"
+    transport: sse
     headers:
       Authorization: "Bearer ***"
 ```
@@ -100,8 +106,9 @@ Hermes reads MCP config from `~/.hermes/config.yaml` under `mcp_servers`.
 | `command` | string | Executable for a stdio MCP server |
 | `args` | list | Arguments for the stdio server |
 | `env` | mapping | Environment variables passed to the stdio server |
-| `url` | string | HTTP MCP endpoint |
+| `url` | string | HTTP or SSE MCP endpoint |
 | `headers` | mapping | HTTP headers for remote servers |
+| `transport` | string | Optional override: `stdio`, `http`, or `sse` |
 | `timeout` | number | Tool call timeout |
 | `connect_timeout` | number | Initial connection timeout |
 | `enabled` | bool | If `false`, Hermes skips the server entirely |

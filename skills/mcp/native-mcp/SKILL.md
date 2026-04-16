@@ -1,6 +1,6 @@
 ---
 name: native-mcp
-description: Built-in MCP (Model Context Protocol) client that connects to external MCP servers, discovers their tools, and registers them as native Hermes Agent tools. Supports stdio and HTTP transports with automatic reconnection, security filtering, and zero-config tool injection.
+description: Built-in MCP (Model Context Protocol) client that connects to external MCP servers, discovers their tools, and registers them as native Hermes Agent tools. Supports stdio, HTTP, and SSE transports with automatic reconnection, security filtering, and zero-config tool injection.
 version: 1.0.0
 author: Hermes Agent
 license: MIT
@@ -60,7 +60,7 @@ You can then use the tools naturally -- just ask the agent to get the current ti
 
 ## Configuration Reference
 
-Each entry under `mcp_servers` is a server name mapped to its config. There are two transport types: **stdio** (command-based) and **HTTP** (url-based).
+Each entry under `mcp_servers` is a server name mapped to its config. There are three transport types: **stdio** (command-based), **HTTP/StreamableHTTP** (url-based), and **SSE** (legacy remote transport).
 
 ### Stdio Transport (command + args)
 
@@ -75,13 +75,24 @@ mcp_servers:
     connect_timeout: 60        # (optional) initial connection timeout in seconds, default: 60
 ```
 
-### HTTP Transport (url)
+### HTTP / SSE Transport (url)
 
 ```yaml
 mcp_servers:
   server_name:
     url: "https://my-server.example.com/mcp"   # (required) server URL
     headers:                                     # (optional) HTTP headers
+      Authorization: "Bearer sk-..."
+```
+
+Legacy SSE endpoints are also supported. Hermes auto-detects URLs ending in `/sse`, or you can set `transport: sse` explicitly:
+
+```yaml
+mcp_servers:
+  legacy_remote:
+    url: "https://my-server.example.com/sse"
+    transport: sse
+    headers:
       Authorization: "Bearer sk-..."
     timeout: 180               # (optional) per-tool-call timeout in seconds, default: 120
     connect_timeout: 60        # (optional) initial connection timeout in seconds, default: 60
@@ -94,8 +105,9 @@ mcp_servers:
 | `command`         | string | --      | Executable to run (stdio transport, required)     |
 | `args`            | list   | `[]`    | Arguments passed to the command                   |
 | `env`             | dict   | `{}`    | Extra environment variables for the subprocess    |
-| `url`             | string | --      | Server URL (HTTP transport, required)             |
+| `url`             | string | --      | Server URL (HTTP/SSE transport, required)         |
 | `headers`         | dict   | `{}`    | HTTP headers sent with every request              |
+| `transport`       | string | auto    | Optional override: `stdio`, `http`, or `sse`     |
 | `timeout`         | int    | `120`   | Per-tool-call timeout in seconds                  |
 | `connect_timeout` | int    | `60`    | Timeout for initial connection and discovery      |
 
@@ -157,14 +169,20 @@ mcp_servers:
 
 The subprocess inherits a **filtered** environment (see Security section below) plus any variables you specify in `env`.
 
-### HTTP / StreamableHTTP Transport
+### HTTP / StreamableHTTP / SSE Transport
 
-For remote or shared MCP servers. Requires the `mcp` package to include HTTP client support (`mcp.client.streamable_http`).
+For remote or shared MCP servers. StreamableHTTP requires `mcp.client.streamable_http`. Legacy SSE endpoints require `mcp.client.sse`.
 
 ```yaml
 mcp_servers:
   remote_api:
     url: "https://mcp.example.com/mcp"
+    headers:
+      Authorization: "Bearer sk-..."
+
+  legacy_api:
+    url: "https://mcp.example.com/sse"
+    transport: sse
     headers:
       Authorization: "Bearer sk-..."
 ```

@@ -2,7 +2,7 @@
 """
 MCP (Model Context Protocol) Client Support
 
-Connects to external MCP servers via stdio or HTTP/StreamableHTTP transport,
+Connects to external MCP servers via stdio, HTTP/StreamableHTTP, or SSE transport,
 discovers their tools, and registers them into the hermes-agent tool registry
 so the agent can call them like any built-in tool.
 
@@ -43,7 +43,7 @@ Example config::
           log_level: "info"          # audit verbosity
 
 Features:
-    - Stdio transport (command + args) and HTTP/StreamableHTTP transport (url)
+    - Stdio transport (command + args), HTTP/StreamableHTTP, and SSE transport
     - Automatic reconnection with exponential backoff (up to 5 retries)
     - Environment variable filtering for stdio subprocesses (security)
     - Credential stripping in error messages returned to the LLM
@@ -81,6 +81,7 @@ import shutil
 import threading
 import time
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,7 @@ logger = logging.getLogger(__name__)
 
 _MCP_AVAILABLE = False
 _MCP_HTTP_AVAILABLE = False
+_MCP_SSE_AVAILABLE = False
 _MCP_SAMPLING_TYPES = False
 _MCP_NOTIFICATION_TYPES = False
 _MCP_MESSAGE_HANDLER_SUPPORTED = False
@@ -97,6 +99,11 @@ try:
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
     _MCP_AVAILABLE = True
+    try:
+        from mcp.client.sse import sse_client
+        _MCP_SSE_AVAILABLE = True
+    except ImportError:
+        _MCP_SSE_AVAILABLE = False
     try:
         from mcp.client.streamable_http import streamablehttp_client
         _MCP_HTTP_AVAILABLE = True
@@ -185,6 +192,38 @@ _CREDENTIAL_PATTERN = re.compile(
     r")",
     re.IGNORECASE,
 )
+
+
+def _normalize_transport_name(value: Any) -> str:
+    """Normalize config transport aliases to stdio/http/sse."""
+    transport = str(value or "").strip().lower().replace("-", "_")
+    if transport in {"http", "streamable_http", "streamablehttp"}:
+        return "http"
+    if transport in {"sse", "stdio"}:
+        return transport
+    return ""
+
+
+def _detect_transport(config: dict) -> str:
+    """Infer the transport type from explicit config or remote URL shape."""
+    explicit = _normalize_transport_name(config.get("transport"))
+    if explicit:
+        return explicit
+
+    url = str(config.get("url") or "").strip()
+    if url:
+        path = urlparse(url).path.rstrip("/").lower()
+        if path.endswith("/sse"):
+            return "sse"
+        return "http"
+
+    return "stdio"
+
+
+def _transport_label(config: dict) -> str:
+    """Return a user-facing transport label for logs/status."""
+    transport = _detect_transport(config)
+    return "HTTP" if transport == "http" else transport.upper()
 
 
 # ---------------------------------------------------------------------------
@@ -778,7 +817,7 @@ class MCPServerTask:
     runs inside one asyncio Task so that anyio cancel-scopes created by
     the transport client are entered and exited in the same Task context.
 
-    Supports both stdio and HTTP/StreamableHTTP transports.
+    Supports stdio, HTTP/StreamableHTTP, and legacy SSE transports.
     """
 
     __slots__ = (
@@ -803,8 +842,12 @@ class MCPServerTask:
         self._refresh_lock = asyncio.Lock()
 
     def _is_http(self) -> bool:
-        """Check if this server uses HTTP transport."""
-        return "url" in self._config
+        """Check if this server uses a remote URL-based transport."""
+        return self._transport() in {"http", "sse"}
+
+    def _transport(self) -> str:
+        """Return the normalized transport type for this server."""
+        return _detect_transport(self._config)
 
     # ----- Dynamic tool discovery (notifications/tools/list_changed) -----
 
@@ -1014,6 +1057,48 @@ class MCPServerTask:
                     self._ready.set()
                     await self._shutdown_event.wait()
 
+    async def _run_sse(self, config: dict):
+        """Run the server using the legacy SSE transport."""
+        if not _MCP_SSE_AVAILABLE:
+            raise ImportError(
+                f"MCP server '{self.name}' requires SSE transport but "
+                "mcp.client.sse is not available. Upgrade the mcp package "
+                "to get SSE support."
+            )
+
+        url = config["url"]
+        headers = dict(config.get("headers") or {})
+        connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
+
+        _oauth_auth = None
+        if self._auth_type == "oauth":
+            try:
+                from tools.mcp_oauth import build_oauth_auth
+                _oauth_auth = build_oauth_auth(
+                    self.name, url, config.get("oauth")
+                )
+            except Exception as exc:
+                logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
+                raise
+
+        sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
+        if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
+            sampling_kwargs["message_handler"] = self._make_message_handler()
+
+        async with sse_client(
+            url,
+            headers=headers or None,
+            timeout=float(connect_timeout),
+            sse_read_timeout=300.0,
+            auth=_oauth_auth,
+        ) as (read_stream, write_stream):
+            async with ClientSession(read_stream, write_stream, **sampling_kwargs) as session:
+                await session.initialize()
+                self.session = session
+                await self._discover_tools()
+                self._ready.set()
+                await self._shutdown_event.wait()
+
     async def _discover_tools(self):
         """Discover tools from the connected session."""
         if self.session is None:
@@ -1046,7 +1131,7 @@ class MCPServerTask:
         if "url" in config and "command" in config:
             logger.warning(
                 "MCP server '%s' has both 'url' and 'command' in config. "
-                "Using HTTP transport ('url'). Remove 'command' to silence "
+                "Using remote transport ('url'). Remove 'command' to silence "
                 "this warning.",
                 self.name,
             )
@@ -1056,8 +1141,11 @@ class MCPServerTask:
 
         while True:
             try:
-                if self._is_http():
+                transport = self._transport()
+                if transport == "http":
                     await self._run_http(config)
+                elif transport == "sse":
+                    await self._run_sse(config)
                 else:
                     await self._run_stdio(config)
                 # Normal exit (shutdown requested) -- break out
@@ -1308,8 +1396,8 @@ def _load_mcp_config() -> Dict[str, dict]:
 
     Returns a dict of ``{server_name: server_config}`` or empty dict.
     Server config can contain either ``command``/``args``/``env`` for stdio
-    transport or ``url``/``headers`` for HTTP transport, plus optional
-    ``timeout``, ``connect_timeout``, and ``auth`` overrides.
+    transport or ``url``/``headers`` for remote HTTP/SSE transport, plus
+    optional ``transport``/``timeout``/``connect_timeout``/``auth`` overrides.
 
     ``${ENV_VAR}`` placeholders in string values are resolved from
     ``os.environ`` (which includes ``~/.hermes/.env`` loaded at startup).
@@ -1976,7 +2064,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     registered_names = _register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)
 
-    transport_type = "HTTP" if "url" in config else "stdio"
+    transport_type = _transport_label(config)
     logger.info(
         "MCP server '%s' (%s): registered %d tool(s): %s",
         name, transport_type, len(registered_names),
@@ -2132,7 +2220,7 @@ def get_mcp_status() -> List[dict]:
         active_servers = dict(_servers)
 
     for name, cfg in configured.items():
-        transport = "http" if "url" in cfg else "stdio"
+        transport = _detect_transport(cfg)
         server = active_servers.get(name)
         if server and server.session is not None:
             entry = {
