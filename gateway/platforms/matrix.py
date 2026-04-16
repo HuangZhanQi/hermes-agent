@@ -1477,9 +1477,9 @@ class MatrixAdapter(BasePlatformAdapter):
 
         # Cache media locally when downstream tools need a real file path.
         cached_path = None
-        should_cache_locally = (
-            msg_type == MessageType.PHOTO or is_voice_message or is_encrypted_media
-        )
+        should_cache_locally = msg_type in (
+            MessageType.PHOTO, MessageType.AUDIO, MessageType.VIDEO, MessageType.DOCUMENT,
+        ) or is_voice_message or is_encrypted_media
         if should_cache_locally and url:
             try:
                 file_bytes = await self._client.download_media(ContentURI(url))

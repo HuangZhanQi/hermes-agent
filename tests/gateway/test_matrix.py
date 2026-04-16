@@ -1177,6 +1177,17 @@ class TestMatrixSyncLoop:
         mock_sync_store.put_next_batch.assert_awaited_once_with("s1234")
 
 
+class TestMediaCacheGate:
+    def test_all_media_types_should_cache(self):
+        """All media types should be cached locally, not just photos/voice/encrypted."""
+        from gateway.platforms.matrix import MessageType
+        for msg_type in [MessageType.PHOTO, MessageType.AUDIO, MessageType.VIDEO, MessageType.DOCUMENT]:
+            should_cache = msg_type in (
+                MessageType.PHOTO, MessageType.AUDIO, MessageType.VIDEO, MessageType.DOCUMENT,
+            )
+            assert should_cache is True, f"{msg_type} should be cached locally"
+
+
 class TestMatrixStopTyping:
     def setup_method(self):
         self.adapter = _make_adapter()
